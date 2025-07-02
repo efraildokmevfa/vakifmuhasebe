@@ -86,20 +86,75 @@ def create_is_avansi():
 @is_avansi_bp.route('', methods=['GET'])
 @token_required
 def get_is_avanslari():
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', 15, type=int)
+    tarih_baslangic_str = request.args.get('tarih_baslangic') # Veriliş tarihi için
+    tarih_bitis_str = request.args.get('tarih_bitis') # Veriliş tarihi için
+    sirala_alan = request.args.get('sirala_alan', 'verilis_tarihi')
+    sirala_yon = request.args.get('sirala_yon', 'desc')
+
     personel_id_filter = request.args.get('personel_id', type=int)
     durum_filter = request.args.get('durum')
-    avans_tipi_filter = request.args.get('avans_tipi') # Yeni filtre
+    avans_tipi_filter = request.args.get('avans_tipi')
+    kasa_id_filter = request.args.get('kasa_id', type=int)
+    min_tutar_filter = request.args.get('min_tutar', type=Decimal)
+    max_tutar_filter = request.args.get('max_tutar', type=Decimal)
+    para_birimi_filter = request.args.get('para_birimi')
 
     query = IsAvansi.query
+
+    if tarih_baslangic_str:
+        try:
+            tarih_baslangic = datetime.fromisoformat(tarih_baslangic_str)
+            query = query.filter(IsAvansi.verilis_tarihi >= tarih_baslangic)
+        except ValueError:
+            return jsonify({'message': 'Geçersiz tarih_baslangic formatı.'}), 400
+    if tarih_bitis_str:
+        try:
+            tarih_bitis = datetime.fromisoformat(tarih_bitis_str).replace(hour=23, minute=59, second=59)
+            query = query.filter(IsAvansi.verilis_tarihi <= tarih_bitis)
+        except ValueError:
+            return jsonify({'message': 'Geçersiz tarih_bitis formatı.'}), 400
+
     if personel_id_filter:
         query = query.filter(IsAvansi.personel_id == personel_id_filter)
     if durum_filter:
         query = query.filter(IsAvansi.durum == durum_filter)
     if avans_tipi_filter and avans_tipi_filter in ['İş', 'Maaş']:
         query = query.filter(IsAvansi.avans_tipi == avans_tipi_filter)
+    if kasa_id_filter:
+        query = query.filter(IsAvansi.kasa_id == kasa_id_filter)
+    if min_tutar_filter is not None:
+        query = query.filter(IsAvansi.verilen_tutar >= min_tutar_filter)
+    if max_tutar_filter is not None:
+        query = query.filter(IsAvansi.verilen_tutar <= max_tutar_filter)
+    if para_birimi_filter:
+        query = query.filter(IsAvansi.para_birimi == para_birimi_filter.upper())
 
-    avanslar = query.order_by(IsAvansi.verilis_tarihi.desc()).all()
-    return jsonify([avans.to_dict() for avans in avanslar]), 200
+    valid_sort_fields = {
+        'verilis_tarihi': IsAvansi.verilis_tarihi,
+        'verilen_tutar': IsAvansi.verilen_tutar,
+        'personel_id': IsAvansi.personel_id,
+        'avans_tipi': IsAvansi.avans_tipi,
+        'durum': IsAvansi.durum,
+        'id': IsAvansi.id
+    }
+    sort_column = valid_sort_fields.get(sirala_alan, IsAvansi.verilis_tarihi)
+
+    if sirala_yon == 'asc':
+        query = query.order_by(sort_column.asc())
+    else:
+        query = query.order_by(sort_column.desc())
+
+    paginated_avanslar = query.paginate(page=page, per_page=per_page, error_out=False)
+
+    return jsonify({
+        'avanslar': [a.to_dict() for a in paginated_avanslar.items],
+        'total': paginated_avanslar.total,
+        'page': paginated_avanslar.page,
+        'per_page': paginated_avanslar.per_page,
+        'total_pages': paginated_avanslar.pages
+    }), 200
 
 @is_avansi_bp.route('/<int:avans_id>', methods=['GET'])
 @token_required

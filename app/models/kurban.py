@@ -62,11 +62,14 @@ class KurbanBagisi(db.Model):
 
     aciklama = db.Column(db.Text, nullable=True) # Genel açıklamalar, notlar
 
-    # Bağışın hangi kasaya girdiği
-    gelir_kasa_id = db.Column(db.Integer, db.ForeignKey('kasalar.id'), nullable=False)
+    # Bağışın nasıl alındığı ve nereye kaydedildiği
+    alinan_sekli = db.Column(db.String(50), nullable=False, default="Nakit Kasa") # Nakit Kasa, Banka, Mütevelli Üzerinden
+    gelir_kasa_id = db.Column(db.Integer, db.ForeignKey('kasalar.id'), nullable=True) # alinan_sekli 'Nakit Kasa' veya 'Banka' ise zorunlu
+    mutevelli_cari_id = db.Column(db.Integer, db.ForeignKey('cari_hesaplar.id'), nullable=True) # alinan_sekli 'Mütevelli Üzerinden' ise zorunlu
 
     gelir_kasa = relationship("Kasa", foreign_keys=[gelir_kasa_id])
     kesim_masraf_kasa = relationship("Kasa", foreign_keys=[kesim_masraf_kasa_id])
+    mutevelli_cari_hesap = relationship("CariHesap", foreign_keys=[mutevelli_cari_id])
 
 
     def __repr__(self):
@@ -96,6 +99,9 @@ class KurbanBagisi(db.Model):
             'sahibine_bilgi_verildi': self.sahibine_bilgi_verildi,
             'bilgilendirme_tarihi': self.bilgilendirme_tarihi.isoformat() if self.bilgilendirme_tarihi else None,
             'aciklama': self.aciklama,
+            'alinan_sekli': self.alinan_sekli,
             'gelir_kasa_id': self.gelir_kasa_id,
-            'gelir_kasa_adi': self.gelir_kasa.kasa_adi if self.gelir_kasa else None
+            'gelir_kasa_adi': self.gelir_kasa.kasa_adi if self.gelir_kasa else None,
+            'mutevelli_cari_id': self.mutevelli_cari_id,
+            'mutevelli_adi': self.mutevelli_cari_hesap.hesap_adi if self.mutevelli_cari_hesap else None
         }

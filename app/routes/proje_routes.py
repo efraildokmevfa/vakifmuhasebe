@@ -134,17 +134,64 @@ def create_proje():
 @proje_bp.route('', methods=['GET'])
 @token_required
 def get_projeler():
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', 15, type=int)
+    tarih_baslangic_str = request.args.get('tarih_baslangic') # Proje başlangıç tarihi için
+    tarih_bitis_str = request.args.get('tarih_bitis') # Proje başlangıç tarihi için
+    sirala_alan = request.args.get('sirala_alan', 'baslangic_tarihi')
+    sirala_yon = request.args.get('sirala_yon', 'desc')
+
     durum_filter = request.args.get('durum')
     proje_turu_id_filter = request.args.get('proje_turu_id', type=int)
+    proje_adi_filter = request.args.get('proje_adi') # Proje adına göre arama
 
     query = Proje.query
+
+    if tarih_baslangic_str:
+        try:
+            tarih_baslangic = datetime.fromisoformat(tarih_baslangic_str).date()
+            query = query.filter(Proje.baslangic_tarihi >= tarih_baslangic)
+        except ValueError:
+            return jsonify({'message': 'Geçersiz tarih_baslangic formatı. YYYY-MM-DD kullanın.'}), 400
+    if tarih_bitis_str: # Bu bitiş tarihi, projenin başlangıç tarihinin bitiş aralığı mı, yoksa projenin bitiş tarihinin mi?
+                        # Şimdilik başlangıç tarihi için üst sınır olarak alalım.
+        try:
+            tarih_bitis = datetime.fromisoformat(tarih_bitis_str).date()
+            query = query.filter(Proje.baslangic_tarihi <= tarih_bitis)
+        except ValueError:
+            return jsonify({'message': 'Geçersiz tarih_bitis formatı. YYYY-MM-DD kullanın.'}), 400
+
     if durum_filter:
         query = query.filter(Proje.durum == durum_filter)
     if proje_turu_id_filter:
         query = query.filter(Proje.proje_turu_id == proje_turu_id_filter)
+    if proje_adi_filter:
+        query = query.filter(Proje.proje_adi.ilike(f"%{proje_adi_filter}%"))
 
-    projeler = query.order_by(Proje.baslangic_tarihi.desc().nullslast(), Proje.id.desc()).all()
-    return jsonify([proje.to_dict() for proje in projeler]), 200
+    valid_sort_fields = {
+        'baslangic_tarihi': Proje.baslangic_tarihi,
+        'proje_adi': Proje.proje_adi,
+        'durum': Proje.durum,
+        'proje_butcesi': Proje.proje_butcesi,
+        'id': Proje.id
+    }
+    sort_column = valid_sort_fields.get(sirala_alan, Proje.baslangic_tarihi)
+
+    if sirala_yon == 'asc':
+        # Nullable alanlarda nullsfirst() veya nullslast() eklenebilir.
+        query = query.order_by(sort_column.asc().nullslast()) if sort_column is Proje.baslangic_tarihi else query.order_by(sort_column.asc())
+    else:
+        query = query.order_by(sort_column.desc().nullslast()) if sort_column is Proje.baslangic_tarihi else query.order_by(sort_column.desc())
+
+    paginated_projeler = query.paginate(page=page, per_page=per_page, error_out=False)
+
+    return jsonify({
+        'projeler': [p.to_dict() for p in paginated_projeler.items],
+        'total': paginated_projeler.total,
+        'page': paginated_projeler.page,
+        'per_page': paginated_projeler.per_page,
+        'total_pages': paginated_projeler.pages
+    }), 200
 
 @proje_bp.route('/<int:proje_id>', methods=['GET'])
 @token_required
@@ -235,10 +282,21 @@ def create_proje_harcamasi(proje_id):
     proje = Proje.query.get_or_404(proje_id)
     data = request.get_json()
 
-    required_fields = ['kasa_id', 'aciklama', 'tutar', 'para_birimi']
+    required_fields = ['aciklama', 'tutar', 'para_birimi', 'odeme_kaynagi']
     for field in required_fields:
         if not data.get(field):
             return jsonify({'message': f'Eksik bilgi: {field} zorunludur'}), 400
+
+    odeme_kaynagi = data['odeme_kaynagi']
+    kasa_id = data.get('kasa_id')
+    mutevelli_cari_id = data.get('mutevelli_cari_id')
+
+    if odeme_kaynagi == "Kasa" and not kasa_id:
+        return jsonify({'message': 'Ödeme kaynağı Kasa ise kasa_id zorunludur.'}), 400
+    if odeme_kaynagi == "Mütevelli" and not mutevelli_cari_id:
+        return jsonify({'message': 'Ödeme kaynağı Mütevelli ise mutevelli_cari_id zorunludur.'}), 400
+    if odeme_kaynagi not in ["Kasa", "Mütevelli"]:
+        return jsonify({'message': 'Geçersiz odeme_kaynagi değeri.'}), 400
 
     try:
         tutar_decimal = Decimal(data['tutar'])
@@ -247,23 +305,37 @@ def create_proje_harcamasi(proje_id):
     except (ValueError, TypeError):
         return jsonify({'message': 'Geçersiz harcama tutarı.'}), 400
 
-    kasa = Kasa.query.get(data['kasa_id'])
-    if not kasa:
-        return jsonify({'message': 'Harcama kasası bulunamadı.'}), 404
+    kasa = None
+    if odeme_kaynagi == "Kasa":
+        kasa = Kasa.query.get(kasa_id)
+        if not kasa:
+            return jsonify({'message': 'Harcama kasası bulunamadı.'}), 404
+        if kasa.para_birimi.upper() != data['para_birimi'].upper():
+            return jsonify({'message': f'Harcama para birimi ({data["para_birimi"]}) ile kasa para birimi ({kasa.para_birimi}) uyuşmuyor.'}), 400
+        if kasa.bakiye < tutar_decimal:
+            return jsonify({'message': f'Harcama kasasında ({kasa.kasa_adi}) yeterli bakiye yok. Bakiye: {kasa.bakiye}'}), 400
 
-    if kasa.para_birimi.upper() != data['para_birimi'].upper():
-        return jsonify({'message': f'Harcama para birimi ({data["para_birimi"]}) ile kasa para birimi ({kasa.para_birimi}) uyuşmuyor.'}), 400
+    mutevelli_cari = None
+    if odeme_kaynagi == "Mütevelli":
+        from app.models.cari_hesap import CariHesap
+        mutevelli_cari = CariHesap.query.get(mutevelli_cari_id)
+        if not mutevelli_cari:
+            return jsonify({'message': 'Mütevelli cari hesabı bulunamadı.'}), 404
+        if mutevelli_cari.hesap_turu != "Mütevelli":
+             return jsonify({'message': 'Belirtilen cari hesap bir mütevelli hesabı değil.'}), 400
+        if mutevelli_cari.para_birimi.upper() != data['para_birimi'].upper():
+            return jsonify({'message': f'Harcama para birimi ({data["para_birimi"]}) ile mütevelli cari para birimi ({mutevelli_cari.para_birimi}) uyuşmuyor.'}), 400
 
-    if kasa.bakiye < tutar_decimal:
-        return jsonify({'message': f'Harcama kasasında ({kasa.kasa_adi}) yeterli bakiye yok. Bakiye: {kasa.bakiye}'}), 400
 
     yeni_harcama = ProjeHarcamasi(
         proje_id=proje_id,
-        kasa_id=data['kasa_id'],
         aciklama=data['aciklama'],
         tutar=tutar_decimal,
         para_birimi=data['para_birimi'].upper(),
-        user_id=g.current_user.id
+        user_id=g.current_user.id,
+        odeme_kaynagi=odeme_kaynagi,
+        kasa_id=kasa_id if odeme_kaynagi == "Kasa" else None,
+        mutevelli_cari_id=mutevelli_cari_id if odeme_kaynagi == "Mütevelli" else None
     )
     if data.get('harcama_tarihi'):
         try:
@@ -282,21 +354,35 @@ def create_proje_harcamasi(proje_id):
 
         db.session.flush() # yeni_harcama için ID oluşturulsun
 
-        kasa_hareketi = add_kasa_hareketi(
-            kasa_id=kasa.id,
-            tutar=-tutar_decimal, # Gider olduğu için negatif
-            islem_tipi="Proje Harcaması",
-            aciklama=f"Proje: {proje.proje_adi} - {data['aciklama']}",
-            referans_tablo='proje_harcamalari',
-            referans_id=yeni_harcama.id, # Flush sayesinde ID burada mevcut
-            user_id=g.current_user.id,
-            commit_session=False # Ana commit dışarıda yapılacak
-        )
-        # add_kasa_hareketi içinde kasa ve hareket session'a eklendi.
+        if odeme_kaynagi == "Kasa":
+            if not kasa: raise ValueError("Harcama kasası geçerli değil.")
+            add_kasa_hareketi(
+                kasa_id=kasa.id,
+                tutar=-tutar_decimal, # Gider
+                islem_tipi="Proje Harcaması",
+                aciklama=f"Proje: {proje.proje_adi} - {data['aciklama']}",
+                referans_tablo='proje_harcamalari',
+                referans_id=yeni_harcama.id,
+                user_id=g.current_user.id,
+                commit_session=False
+            )
+        elif odeme_kaynagi == "Mütevelli":
+            if not mutevelli_cari: raise ValueError("Mütevelli cari hesabı geçerli değil.")
+            from app.routes.cari_hesap_routes import add_cari_hesap_hareketi
+            add_cari_hesap_hareketi(
+                cari_hesap_id=mutevelli_cari.id,
+                tutar=-tutar_decimal, # Mütevelli alacaklandı (vakıf borçlandı)
+                islem_tipi="Mütevelli Ödemeli Proje Harcaması",
+                aciklama=f"Proje: {proje.proje_adi} - {data['aciklama']}",
+                referans_tablo='proje_harcamalari',
+                referans_id=yeni_harcama.id,
+                user_id=g.current_user.id,
+                commit_session=False
+            )
 
-        db.session.commit() # Tüm değişiklikleri (yeni_harcama, kasa bakiyesi, kasa_hareketi) commit et.
+        db.session.commit()
 
-    except ValueError as ve: # Kasa bakiye yetersiz veya kasa bulunamadı vb.
+    except ValueError as ve:
         db.session.rollback()
         return jsonify({'message': str(ve)}), 400
     except Exception as e:
@@ -315,14 +401,32 @@ def update_proje_harcamasi(harcama_id):
     if not data:
         return jsonify({'message': 'Güncellenecek veri bulunamadı'}), 400
 
-    # Eski değerleri sakla (kasa hareketini düzeltmek için)
+    # Eski değerleri sakla
     eski_tutar = harcama.tutar
+    eski_odeme_kaynagi = harcama.odeme_kaynagi
     eski_kasa_id = harcama.kasa_id
-    eski_aciklama_detay = f"Proje: {harcama.proje.proje_adi} - {harcama.aciklama}"
+    eski_mutevelli_cari_id = harcama.mutevelli_cari_id
+    eski_para_birimi = harcama.para_birimi # Para birimi değişikliği de ele alınmalı
+    # Proje adı değişebileceği için açıklama için proje adını dinamik alalım
+    # eski_aciklama_detay = f"Proje: {harcama.proje.proje_adi} - {harcama.aciklama}"
 
 
-    # Alanları güncelle
+    # Yeni değerleri al
     harcama.aciklama = data.get('aciklama', harcama.aciklama)
+    yeni_odeme_kaynagi = data.get('odeme_kaynagi', eski_odeme_kaynagi)
+    yeni_kasa_id = data.get('kasa_id') # Eğer Kasa ise güncellenecek
+    yeni_mutevelli_cari_id = data.get('mutevelli_cari_id') # Eğer Mütevelli ise güncellenecek
+    yeni_tutar_str = data.get('tutar')
+    yeni_para_birimi = data.get('para_birimi', eski_para_birimi).upper()
+
+    if yeni_odeme_kaynagi == "Kasa" and not yeni_kasa_id and not (eski_odeme_kaynagi == "Kasa" and eski_kasa_id) :
+        return jsonify({'message': 'Yeni ödeme kaynağı Kasa ise yeni kasa_id zorunludur (veya eskisi kullanılacaksa belirtilmemeli).'}), 400
+    if yeni_odeme_kaynagi == "Mütevelli" and not yeni_mutevelli_cari_id and not (eski_odeme_kaynagi == "Mütevelli" and eski_mutevelli_cari_id):
+        return jsonify({'message': 'Yeni ödeme kaynağı Mütevelli ise yeni mutevelli_cari_id zorunludur (veya eskisi kullanılacaksa belirtilmemeli).'}), 400
+    if yeni_odeme_kaynagi not in ["Kasa", "Mütevelli"]:
+        return jsonify({'message': 'Geçersiz yeni odeme_kaynagi değeri.'}), 400
+
+
     if data.get('harcama_tarihi'):
         try:
             harcama.harcama_tarihi = datetime.fromisoformat(data['harcama_tarihi'])
@@ -330,54 +434,73 @@ def update_proje_harcamasi(harcama_id):
             return jsonify({'message': 'Geçersiz harcama tarihi formatı.'}), 400
 
     yeni_tutar_str = data.get('tutar')
-    yeni_kasa_id = data.get('kasa_id', harcama.kasa_id) # Kasa değişebilir
-    yeni_para_birimi = data.get('para_birimi', harcama.para_birimi).upper() # Para birimi değişebilir (dikkat!)
+
+    # Kasa ID'lerini doğru atayalım
+    if yeni_odeme_kaynagi == "Kasa":
+        yeni_kasa_id = data.get('kasa_id', eski_kasa_id if eski_odeme_kaynagi == "Kasa" else None)
+        if not yeni_kasa_id: return jsonify({'message': 'Ödeme kaynağı Kasa ise kasa_id zorunludur.'}), 400
+    else: # Ödeme kaynağı Mütevelli ise kasa_id null olmalı
+        yeni_kasa_id = None
+
+    if yeni_odeme_kaynagi == "Mütevelli":
+        yeni_mutevelli_cari_id = data.get('mutevelli_cari_id', eski_mutevelli_cari_id if eski_odeme_kaynagi == "Mütevelli" else None)
+        if not yeni_mutevelli_cari_id: return jsonify({'message': 'Ödeme kaynağı Mütevelli ise mutevelli_cari_id zorunludur.'}), 400
+    else: # Ödeme kaynağı Kasa ise mutevelli_cari_id null olmalı
+        yeni_mutevelli_cari_id = None
+
+    yeni_para_birimi = data.get('para_birimi', eski_para_birimi).upper()
+
 
     try:
-        db.session.begin_nested() # İç içe transaction veya savepoint
+        db.session.begin_nested()
 
-        # Kasa ve tutar değişikliği varsa kasa hareketlerini ayarla
-        if yeni_tutar_str is not None or yeni_kasa_id != eski_kasa_id:
-            yeni_tutar = Decimal(yeni_tutar_str) if yeni_tutar_str is not None else eski_tutar
-            if yeni_tutar <= 0:
-                return jsonify({'message': 'Harcama tutarı pozitif olmalı.'}), 400
+        yeni_tutar = Decimal(yeni_tutar_str) if yeni_tutar_str is not None else eski_tutar
+        if yeni_tutar <= 0:
+            raise ValueError('Harcama tutarı pozitif olmalı.')
 
-            # 1. Eski kasa hareketini tersine çevir (eski kasaya iade)
-            add_kasa_hareketi(
-                kasa_id=eski_kasa_id,
-                tutar=eski_tutar, # Pozitif olarak iade
-                islem_tipi="Proje Harcaması Düzeltme (İade)",
-                aciklama=f"Düzeltme: {eski_aciklama_detay}",
-                referans_tablo='proje_harcamalari',
-                referans_id=harcama.id,
-                user_id=g.current_user.id,
-                commit_session=False # Ana commit dışarıda
-            )
+        # Değişiklik var mı kontrolü (tutar, ödeme kaynağı, ilgili ID veya para birimi)
+        is_changed = (yeni_tutar != eski_tutar or \
+                      yeni_odeme_kaynagi != eski_odeme_kaynagi or \
+                      (yeni_odeme_kaynagi == "Kasa" and yeni_kasa_id != eski_kasa_id) or \
+                      (yeni_odeme_kaynagi == "Mütevelli" and yeni_mutevelli_cari_id != eski_mutevelli_cari_id) or \
+                      yeni_para_birimi != eski_para_birimi)
 
-            # 2. Yeni kasa hareketini ekle (yeni kasadan düş)
-            yeni_kasa = Kasa.query.get(yeni_kasa_id)
-            if not yeni_kasa:
-                raise ValueError("Yeni harcama kasası bulunamadı.")
-            if yeni_kasa.para_birimi.upper() != yeni_para_birimi.upper():
-                raise ValueError(f"Yeni harcama para birimi ({yeni_para_birimi}) ile yeni kasa para birimi ({yeni_kasa.para_birimi}) uyuşmuyor.")
+        if is_changed:
+            # 1. Eski hareketi tersine çevir
+            aciklama_iptal = f"Düzeltme (İptal): Proje Harcaması ID {harcama.id} - Proje: {harcama.proje.proje_adi}"
+            if eski_odeme_kaynagi == "Kasa" and eski_kasa_id:
+                add_kasa_hareketi(eski_kasa_id, eski_tutar, "Proje Harcaması Düzeltme (İade)", aciklama_iptal, 'proje_harcamalari', harcama.id, g.current_user.id, False)
+            elif eski_odeme_kaynagi == "Mütevelli" and eski_mutevelli_cari_id:
+                from app.routes.cari_hesap_routes import add_cari_hesap_hareketi
+                add_cari_hesap_hareketi(eski_mutevelli_cari_id, eski_tutar, "Proje Harcaması Düzeltme (Mütevelli Alacak İptali)", aciklama_iptal, 'proje_harcamalari', harcama.id, g.current_user.id, False)
 
-            # Kasa bakiyesi kontrolü add_kasa_hareketi içinde yapılacak.
-            add_kasa_hareketi(
-                kasa_id=yeni_kasa_id,
-                tutar=-yeni_tutar, # Gider
-                islem_tipi="Proje Harcaması",
-                aciklama=f"Proje: {harcama.proje.proje_adi} - {harcama.aciklama}", # Güncellenmiş açıklama
-                referans_tablo='proje_harcamalari',
-                referans_id=harcama.id,
-                user_id=g.current_user.id,
-                commit_session=False
-            )
-            harcama.tutar = yeni_tutar
-            harcama.kasa_id = yeni_kasa_id
-            harcama.para_birimi = yeni_para_birimi
+            # 2. Yeni hareketi ekle
+            aciklama_yeni = f"Proje: {harcama.proje.proje_adi} - {data.get('aciklama', harcama.aciklama)}"
+            if yeni_odeme_kaynagi == "Kasa":
+                yeni_kasa_obj = Kasa.query.get(yeni_kasa_id)
+                if not yeni_kasa_obj: raise ValueError("Yeni harcama kasası bulunamadı.")
+                if yeni_kasa_obj.para_birimi.upper() != yeni_para_birimi:
+                    raise ValueError(f"Yeni harcama para birimi ({yeni_para_birimi}) ile yeni kasa para birimi ({yeni_kasa_obj.para_birimi}) uyuşmuyor.")
+                add_kasa_hareketi(yeni_kasa_id, -yeni_tutar, "Proje Harcaması", aciklama_yeni, 'proje_harcamalari', harcama.id, g.current_user.id, False)
+            elif yeni_odeme_kaynagi == "Mütevelli":
+                from app.models.cari_hesap import CariHesap
+                yeni_mutevelli_obj = CariHesap.query.get(yeni_mutevelli_cari_id)
+                if not yeni_mutevelli_obj: raise ValueError("Yeni mütevelli cari hesabı bulunamadı.")
+                if yeni_mutevelli_obj.hesap_turu != "Mütevelli": raise ValueError("Belirtilen cari hesap mütevelli değil.")
+                if yeni_mutevelli_obj.para_birimi.upper() != yeni_para_birimi:
+                    raise ValueError(f"Yeni harcama para birimi ({yeni_para_birimi}) ile yeni mütevelli cari para birimi ({yeni_mutevelli_obj.para_birimi}) uyuşmuyor.")
+                from app.routes.cari_hesap_routes import add_cari_hesap_hareketi
+                add_cari_hesap_hareketi(yeni_mutevelli_cari_id, -yeni_tutar, "Mütevelli Ödemeli Proje Harcaması", aciklama_yeni, 'proje_harcamalari', harcama.id, g.current_user.id, False)
+
+        # Harcama objesini güncelle
+        harcama.tutar = yeni_tutar
+        harcama.odeme_kaynagi = yeni_odeme_kaynagi
+        harcama.kasa_id = yeni_kasa_id if yeni_odeme_kaynagi == "Kasa" else None
+        harcama.mutevelli_cari_id = yeni_mutevelli_cari_id if yeni_odeme_kaynagi == "Mütevelli" else None
+        harcama.para_birimi = yeni_para_birimi
 
         db.session.add(harcama)
-        db.session.commit() # Ana transaction'ı commit et
+        db.session.commit()
     except ValueError as ve:
         db.session.rollback()
         return jsonify({'message': str(ve)}), 400
@@ -395,20 +518,36 @@ def delete_proje_harcamasi(harcama_id):
     harcama = ProjeHarcamasi.query.get_or_404(harcama_id)
 
     try:
-        # Kasa hareketini tersine çevir (kasaya iade)
-        add_kasa_hareketi(
-            kasa_id=harcama.kasa_id,
-            tutar=harcama.tutar, # Pozitif olarak iade
-            islem_tipi="Proje Harcaması Silme (İade)",
-            aciklama=f"Silinen Harcama: Proje: {harcama.proje.proje_adi} - {harcama.aciklama}",
-            referans_tablo='proje_harcamalari',
-            referans_id=harcama.id,
-            user_id=g.current_user.id,
-            commit_session=False # Ana commit dışarıda
-        )
+        db.session.begin_nested() # İşlemleri grupla
+        aciklama_iptal = f"Silinen Harcama ID {harcama.id}: Proje: {harcama.proje.proje_adi} - {harcama.aciklama}"
+
+        if harcama.odeme_kaynagi == "Kasa" and harcama.kasa_id:
+            add_kasa_hareketi(
+                kasa_id=harcama.kasa_id,
+                tutar=harcama.tutar, # Pozitif olarak iade
+                islem_tipi="Proje Harcaması Silme (Kasa İade)",
+                aciklama=aciklama_iptal,
+                referans_tablo='proje_harcamalari',
+                referans_id=harcama.id,
+                user_id=g.current_user.id,
+                commit_session=False
+            )
+        elif harcama.odeme_kaynagi == "Mütevelli" and harcama.mutevelli_cari_id:
+            from app.routes.cari_hesap_routes import add_cari_hesap_hareketi
+            add_cari_hesap_hareketi(
+                cari_hesap_id=harcama.mutevelli_cari_id,
+                tutar=harcama.tutar, # Mütevellinin alacağını iptal et (borç hareketi)
+                islem_tipi="Proje Harcaması Silme (Mütevelli Alacak İptali)",
+                aciklama=aciklama_iptal,
+                referans_tablo='proje_harcamalari',
+                referans_id=harcama.id,
+                user_id=g.current_user.id,
+                commit_session=False
+            )
+
         db.session.delete(harcama)
         db.session.commit()
-    except ValueError as ve: # Kasa bulunamadı vs. (Normalde olmamalı)
+    except ValueError as ve:
         db.session.rollback()
         return jsonify({'message': str(ve)}), 400
     except Exception as e:
@@ -416,3 +555,81 @@ def delete_proje_harcamasi(harcama_id):
         return jsonify({'message': f'Proje harcaması silinirken hata: {str(e)}'}), 500
 
     return jsonify({'message': 'Proje harcaması başarıyla silindi'}), 200
+
+@proje_bp.route('/harcamalar', methods=['GET']) # Tüm proje harcamalarını listelemek için
+@token_required
+# @role_required(['admin', 'accountant', 'project_viewer'])
+def get_all_proje_harcamalari():
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', 15, type=int)
+    tarih_baslangic_str = request.args.get('tarih_baslangic') # Harcama tarihi için
+    tarih_bitis_str = request.args.get('tarih_bitis') # Harcama tarihi için
+    sirala_alan = request.args.get('sirala_alan', 'harcama_tarihi')
+    sirala_yon = request.args.get('sirala_yon', 'desc')
+
+    proje_id_filter = request.args.get('proje_id', type=int)
+    kasa_id_filter = request.args.get('kasa_id', type=int)
+    odeme_kaynagi_filter = request.args.get('odeme_kaynagi')
+    mutevelli_cari_id_filter = request.args.get('mutevelli_cari_id', type=int)
+    user_id_filter = request.args.get('user_id', type=int) # Harcamayı giren kullanıcı
+    min_tutar_filter = request.args.get('min_tutar', type=Decimal)
+    max_tutar_filter = request.args.get('max_tutar', type=Decimal)
+    para_birimi_filter = request.args.get('para_birimi')
+
+    query = ProjeHarcamasi.query
+
+    if tarih_baslangic_str:
+        try:
+            tarih_baslangic = datetime.fromisoformat(tarih_baslangic_str)
+            query = query.filter(ProjeHarcamasi.harcama_tarihi >= tarih_baslangic)
+        except ValueError:
+            return jsonify({'message': 'Geçersiz tarih_baslangic formatı.'}), 400
+    if tarih_bitis_str:
+        try:
+            tarih_bitis = datetime.fromisoformat(tarih_bitis_str).replace(hour=23, minute=59, second=59)
+            query = query.filter(ProjeHarcamasi.harcama_tarihi <= tarih_bitis)
+        except ValueError:
+            return jsonify({'message': 'Geçersiz tarih_bitis formatı.'}), 400
+
+    if proje_id_filter:
+        query = query.filter(ProjeHarcamasi.proje_id == proje_id_filter)
+    if kasa_id_filter:
+        query = query.filter(ProjeHarcamasi.kasa_id == kasa_id_filter)
+    if odeme_kaynagi_filter:
+        query = query.filter(ProjeHarcamasi.odeme_kaynagi == odeme_kaynagi_filter)
+    if mutevelli_cari_id_filter:
+        query = query.filter(ProjeHarcamasi.mutevelli_cari_id == mutevelli_cari_id_filter)
+    if user_id_filter:
+        query = query.filter(ProjeHarcamasi.user_id == user_id_filter)
+    if min_tutar_filter is not None:
+        query = query.filter(ProjeHarcamasi.tutar >= min_tutar_filter)
+    if max_tutar_filter is not None:
+        query = query.filter(ProjeHarcamasi.tutar <= max_tutar_filter)
+    if para_birimi_filter:
+        query = query.filter(ProjeHarcamasi.para_birimi == para_birimi_filter.upper())
+
+
+    valid_sort_fields = {
+        'harcama_tarihi': ProjeHarcamasi.harcama_tarihi,
+        'tutar': ProjeHarcamasi.tutar,
+        'proje_id': ProjeHarcamasi.proje_id, # veya proje.proje_adi ile join yapılabilir
+        'kasa_id': ProjeHarcamasi.kasa_id,
+        'odeme_kaynagi': ProjeHarcamasi.odeme_kaynagi,
+        'id': ProjeHarcamasi.id
+    }
+    sort_column = valid_sort_fields.get(sirala_alan, ProjeHarcamasi.harcama_tarihi)
+
+    if sirala_yon == 'asc':
+        query = query.order_by(sort_column.asc())
+    else:
+        query = query.order_by(sort_column.desc())
+
+    paginated_harcamalar = query.paginate(page=page, per_page=per_page, error_out=False)
+
+    return jsonify({
+        'harcamalar': [h.to_dict() for h in paginated_harcamalar.items],
+        'total': paginated_harcamalar.total,
+        'page': paginated_harcamalar.page,
+        'per_page': paginated_harcamalar.per_page,
+        'total_pages': paginated_harcamalar.pages
+    }), 200

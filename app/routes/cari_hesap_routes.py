@@ -116,21 +116,64 @@ def get_cari_hesap_by_id(cari_id):
 @cari_hesap_bp.route('/<int:cari_id>/hareketler', methods=['GET'])
 @token_required
 def get_cari_hesap_hareketleri(cari_id):
-    CariHesap.query.get_or_404(cari_id) # Cari hesabın varlığını kontrol et
+    CariHesap.query.get_or_404(cari_id)
 
     page = request.args.get('page', 1, type=int)
-    per_page = request.args.get('per_page', 10, type=int)
+    per_page = request.args.get('per_page', 15, type=int)
+    tarih_baslangic_str = request.args.get('tarih_baslangic')
+    tarih_bitis_str = request.args.get('tarih_bitis')
+    sirala_alan = request.args.get('sirala_alan', 'tarih')
+    sirala_yon = request.args.get('sirala_yon', 'desc')
 
-    hareketler = CariHesapHareketi.query.filter_by(cari_hesap_id=cari_id)\
-        .order_by(CariHesapHareketi.tarih.desc(), CariHesapHareketi.id.desc())\
-        .paginate(page=page, per_page=per_page, error_out=False)
+    islem_tipi_filter = request.args.get('islem_tipi')
+    referans_tablo_filter = request.args.get('referans_tablo')
+    referans_id_filter = request.args.get('referans_id', type=int)
+    user_id_filter = request.args.get('user_id', type=int)
+
+    query = CariHesapHareketi.query.filter_by(cari_hesap_id=cari_id)
+
+    if tarih_baslangic_str:
+        try:
+            tarih_baslangic = datetime.fromisoformat(tarih_baslangic_str)
+            query = query.filter(CariHesapHareketi.tarih >= tarih_baslangic)
+        except ValueError:
+            return jsonify({'message': 'Geçersiz tarih_baslangic formatı.'}), 400
+    if tarih_bitis_str:
+        try:
+            tarih_bitis = datetime.fromisoformat(tarih_bitis_str).replace(hour=23, minute=59, second=59)
+            query = query.filter(CariHesapHareketi.tarih <= tarih_bitis)
+        except ValueError:
+            return jsonify({'message': 'Geçersiz tarih_bitis formatı.'}), 400
+
+    if islem_tipi_filter:
+        query = query.filter(CariHesapHareketi.islem_tipi.ilike(f"%{islem_tipi_filter}%"))
+    if referans_tablo_filter:
+        query = query.filter(CariHesapHareketi.referans_tablo == referans_tablo_filter)
+    if referans_id_filter:
+        query = query.filter(CariHesapHareketi.referans_id == referans_id_filter)
+    if user_id_filter:
+        query = query.filter(CariHesapHareketi.user_id == user_id_filter)
+
+    valid_sort_fields = {
+        'tarih': CariHesapHareketi.tarih,
+        'tutar': CariHesapHareketi.tutar,
+        'islem_tipi': CariHesapHareketi.islem_tipi,
+        'id': CariHesapHareketi.id
+    }
+    sort_column = valid_sort_fields.get(sirala_alan, CariHesapHareketi.tarih)
+    if sirala_yon == 'asc':
+        query = query.order_by(sort_column.asc())
+    else:
+        query = query.order_by(sort_column.desc(), CariHesapHareketi.id.desc())
+
+    paginated_hareketler = query.paginate(page=page, per_page=per_page, error_out=False)
 
     return jsonify({
-        'hareketler': [h.to_dict() for h in hareketler.items],
-        'total': hareketler.total,
-        'page': hareketler.page,
-        'per_page': hareketler.per_page,
-        'total_pages': hareketler.pages
+        'hareketler': [h.to_dict() for h in paginated_hareketler.items],
+        'total': paginated_hareketler.total,
+        'page': paginated_hareketler.page,
+        'per_page': paginated_hareketler.per_page,
+        'total_pages': paginated_hareketler.pages
     }), 200
 
 @cari_hesap_bp.route('/<int:cari_id>/hareketler', methods=['POST'])
@@ -227,3 +270,147 @@ def delete_cari_hesap(cari_id):
         db.session.rollback()
         return jsonify({'message': f'Cari hesap silinirken hata: {str(e)}'}), 500
     return jsonify({'message': 'Cari hesap başarıyla silindi'}), 200
+
+
+# --- Mütevelli Özel İşlemleri ---
+@cari_hesap_bp.route('/mutevelli/<int:mutevelli_cari_id>/vakfa-aktarim', methods=['POST'])
+@token_required
+# @role_required(['admin', 'accountant']) # Gerekli rolleri belirleyin
+def mutevelli_vakfa_aktarim(mutevelli_cari_id):
+    data = request.get_json()
+    required_fields = ['tutar', 'para_birimi', 'hedef_kasa_id']
+    for field in required_fields:
+        if not data.get(field):
+            return jsonify({'message': f'Eksik bilgi: {field} zorunludur.'}), 400
+
+    try:
+        tutar = Decimal(data['tutar'])
+        if tutar <= 0: raise ValueError("Tutar pozitif olmalı.")
+        hedef_kasa_id = int(data['hedef_kasa_id'])
+    except (ValueError, TypeError):
+        return jsonify({'message': 'Geçersiz tutar veya kasa ID formatı.'}), 400
+
+    mutevelli_cari = CariHesap.query.get_or_404(mutevelli_cari_id)
+    if mutevelli_cari.hesap_turu != "Mütevelli":
+        return jsonify({'message': 'Bu işlem sadece Mütevelli tipindeki cari hesaplar için geçerlidir.'}), 400
+
+    hedef_kasa = Kasa.query.get(hedef_kasa_id)
+    if not hedef_kasa:
+        return jsonify({'message': 'Hedef kasa bulunamadı.'}), 404
+
+    para_birimi = data['para_birimi'].upper()
+    if mutevelli_cari.para_birimi != para_birimi or hedef_kasa.para_birimi != para_birimi:
+        return jsonify({'message': 'Para birimleri uyuşmuyor (Mütevelli Cari, Hedef Kasa, İşlem Tutarı).'}), 400
+
+    aciklama = data.get('aciklama', f"{mutevelli_cari.hesap_adi} adlı mütevelliden vakfa para aktarımı.")
+
+    try:
+        # 1. Mütevelli cari hesabına alacak kaydı (borcu azalır)
+        add_cari_hesap_hareketi(
+            cari_hesap_id=mutevelli_cari_id,
+            tutar=-tutar, # Alacaklandığı için negatif
+            islem_tipi="Mütevelli Vakfa Para Aktarımı",
+            aciklama=aciklama,
+            referans_tablo='kasalar', # Hedef kasaya referans
+            referans_id=hedef_kasa.id,
+            user_id=g.current_user.id,
+            commit_session=False
+        )
+        # 2. Hedef kasaya gelir kaydı
+        from app.routes.kasa_routes import add_kasa_hareketi
+        add_kasa_hareketi(
+            kasa_id=hedef_kasa.id,
+            tutar=tutar, # Gelir
+            islem_tipi="Mütevelliden Para Aktarımı",
+            aciklama=aciklama,
+            referans_tablo='cari_hesaplar', # Kaynak mütevelli carisine referans
+            referans_id=mutevelli_cari.id,
+            user_id=g.current_user.id,
+            commit_session=False
+        )
+        db.session.commit()
+    except ValueError as ve:
+        db.session.rollback()
+        return jsonify({'message': str(ve)}), 400
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'message': f'Mütevelli aktarımı sırasında hata: {str(e)}'}), 500
+
+    return jsonify({
+        'message': 'Mütevelliden vakfa para aktarımı başarıyla kaydedildi.',
+        'mutevelli_cari_bakiye': str(mutevelli_cari.bakiye),
+        'hedef_kasa_bakiye': str(hedef_kasa.bakiye)
+    }), 200
+
+
+@cari_hesap_bp.route('/mutevelli/<int:mutevelli_cari_id>/vakiftan-odeme', methods=['POST'])
+@token_required
+# @role_required(['admin', 'accountant'])
+def mutevelli_vakiftan_odeme(mutevelli_cari_id):
+    data = request.get_json()
+    required_fields = ['tutar', 'para_birimi', 'kaynak_kasa_id']
+    for field in required_fields:
+        if not data.get(field):
+            return jsonify({'message': f'Eksik bilgi: {field} zorunludur.'}), 400
+
+    try:
+        tutar = Decimal(data['tutar'])
+        if tutar <= 0: raise ValueError("Tutar pozitif olmalı.")
+        kaynak_kasa_id = int(data['kaynak_kasa_id'])
+    except (ValueError, TypeError):
+        return jsonify({'message': 'Geçersiz tutar veya kasa ID formatı.'}), 400
+
+    mutevelli_cari = CariHesap.query.get_or_404(mutevelli_cari_id)
+    if mutevelli_cari.hesap_turu != "Mütevelli":
+        return jsonify({'message': 'Bu işlem sadece Mütevelli tipindeki cari hesaplar için geçerlidir.'}), 400
+
+    kaynak_kasa = Kasa.query.get(kaynak_kasa_id)
+    if not kaynak_kasa:
+        return jsonify({'message': 'Kaynak kasa bulunamadı.'}), 404
+
+    para_birimi = data['para_birimi'].upper()
+    if mutevelli_cari.para_birimi != para_birimi or kaynak_kasa.para_birimi != para_birimi:
+        return jsonify({'message': 'Para birimleri uyuşmuyor (Mütevelli Cari, Kaynak Kasa, İşlem Tutarı).'}), 400
+
+    if kaynak_kasa.bakiye < tutar:
+        return jsonify({'message': f'Kaynak kasada ({kaynak_kasa.kasa_adi}) yeterli bakiye yok.'}), 400
+
+    aciklama = data.get('aciklama', f"{mutevelli_cari.hesap_adi} adlı mütevelliye vakıftan ödeme.")
+
+    try:
+        # 1. Mütevelli cari hesabına borç kaydı (alacağı azalır/borcu artar)
+        add_cari_hesap_hareketi(
+            cari_hesap_id=mutevelli_cari_id,
+            tutar=tutar, # Borçlandığı için pozitif
+            islem_tipi="Vakıftan Mütevelliye Ödeme",
+            aciklama=aciklama,
+            referans_tablo='kasalar', # Kaynak kasaya referans
+            referans_id=kaynak_kasa.id,
+            user_id=g.current_user.id,
+            commit_session=False
+        )
+        # 2. Kaynak kasadan gider kaydı
+        from app.routes.kasa_routes import add_kasa_hareketi
+        add_kasa_hareketi(
+            kasa_id=kaynak_kasa.id,
+            tutar=-tutar, # Gider
+            islem_tipi="Mütevelliye Ödeme",
+            aciklama=aciklama,
+            referans_tablo='cari_hesaplar', # Hedef mütevelli carisine referans
+            referans_id=mutevelli_cari.id,
+            user_id=g.current_user.id,
+            commit_session=False
+        )
+        db.session.commit()
+    except ValueError as ve:
+        db.session.rollback()
+        return jsonify({'message': str(ve)}), 400
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'message': f'Mütevelliye ödeme sırasında hata: {str(e)}'}), 500
+
+    return jsonify({
+        'message': 'Vakıftan mütevelliye ödeme başarıyla kaydedildi.',
+        'mutevelli_cari_bakiye': str(mutevelli_cari.bakiye),
+        'kaynak_kasa_bakiye': str(kaynak_kasa.bakiye)
+    }), 200

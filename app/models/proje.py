@@ -34,8 +34,14 @@ class ProjeHarcamasi(db.Model):
     user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)
 
     proje = relationship("Proje", back_populates="harcamalar")
-    kasa = relationship("Kasa") # Kasa bilgilerine ulaşmak için
+    kasa = relationship("Kasa", foreign_keys=[kasa_id])
     user = relationship("User")
+    mutevelli_cari_hesap = relationship("CariHesap", foreign_keys=[mutevelli_cari_id])
+
+    # odeme_kaynagi ve mutevelli_cari_id alanları eklenecek
+    odeme_kaynagi = db.Column(db.String(50), nullable=False, default="Kasa") # Kasa, Mütevelli
+    mutevelli_cari_id = db.Column(db.Integer, db.ForeignKey('cari_hesaplar.id'), nullable=True)
+
 
     def __repr__(self):
         return f'<ProjeHarcamasi ID: {self.id}, Proje: {self.proje_id}, Tutar: {self.tutar}>'
@@ -52,7 +58,10 @@ class ProjeHarcamasi(db.Model):
             'tutar': str(self.tutar),
             'para_birimi': self.para_birimi,
             'user_id': self.user_id,
-            'kullanici_adi': self.user.username if self.user else None
+            'kullanici_adi': self.user.username if self.user else None,
+            'odeme_kaynagi': self.odeme_kaynagi,
+            'mutevelli_cari_id': self.mutevelli_cari_id,
+            'mutevelli_adi': self.mutevelli_cari_hesap.hesap_adi if self.mutevelli_cari_hesap else None
         }
 
 

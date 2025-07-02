@@ -77,10 +77,22 @@ def delete_kurban_turu(tur_id):
 # @role_required(['admin', 'editor', 'data_entry'])
 def create_kurban_bagisi():
     data = request.get_json()
-    required_fields = ['bagisci_adi', 'bagis_tutari', 'para_birimi', 'kurban_turu_id', 'hayvan_turu', 'hisse_adedi', 'gelir_kasa_id']
+    # alinan_sekli ve ona bağlı olarak gelir_kasa_id veya mutevelli_cari_id kontrolü eklenecek
+    required_fields = ['bagisci_adi', 'bagis_tutari', 'para_birimi', 'kurban_turu_id', 'hayvan_turu', 'hisse_adedi', 'alinan_sekli']
     for field in required_fields:
         if not data.get(field):
             return jsonify({'message': f'Eksik bilgi: {field} zorunludur'}), 400
+
+    alinan_sekli = data['alinan_sekli']
+    gelir_kasa_id = data.get('gelir_kasa_id')
+    mutevelli_cari_id = data.get('mutevelli_cari_id')
+
+    if alinan_sekli in ["Nakit Kasa", "Banka"] and not gelir_kasa_id:
+        return jsonify({'message': 'Alınan şekli Kasa veya Banka ise gelir_kasa_id zorunludur.'}), 400
+    if alinan_sekli == "Mütevelli Üzerinden" and not mutevelli_cari_id:
+        return jsonify({'message': 'Alınan şekli Mütevelli Üzerinden ise mutevelli_cari_id zorunludur.'}), 400
+    if alinan_sekli not in ["Nakit Kasa", "Banka", "Mütevelli Üzerinden"]:
+        return jsonify({'message': 'Geçersiz alınan_sekli değeri.'}), 400
 
     try:
         bagis_tutari_decimal = Decimal(data['bagis_tutari'])
@@ -93,19 +105,30 @@ def create_kurban_bagisi():
     if not KurbanTuru.query.get(data['kurban_turu_id']):
         return jsonify({'message': 'Geçersiz kurban türü ID'}), 404
 
-    gelir_kasa = Kasa.query.get(data['gelir_kasa_id'])
-    if not gelir_kasa:
-        return jsonify({'message': 'Gelir kasası bulunamadı'}), 404
+    gelir_kasa = None
+    if alinan_sekli in ["Nakit Kasa", "Banka"]:
+        gelir_kasa = Kasa.query.get(gelir_kasa_id)
+        if not gelir_kasa:
+            return jsonify({'message': 'Gelir kasası bulunamadı.'}), 404
+        if gelir_kasa.para_birimi.upper() != data['para_birimi'].upper():
+            return jsonify({'message': f'Bağış para birimi ({data["para_birimi"]}) ile kasa para birimi ({gelir_kasa.para_birimi}) uyuşmuyor.'}), 400
 
-    if gelir_kasa.para_birimi.upper() != data['para_birimi'].upper():
-        return jsonify({'message': f'Bağış para birimi ({data["para_birimi"]}) ile kasa para birimi ({gelir_kasa.para_birimi}) uyuşmuyor.'}), 400
+    mutevelli_cari = None
+    if alinan_sekli == "Mütevelli Üzerinden":
+        from app.models.cari_hesap import CariHesap # Döngüsel importu önlemek için burada import
+        mutevelli_cari = CariHesap.query.get(mutevelli_cari_id)
+        if not mutevelli_cari:
+            return jsonify({'message': 'Mütevelli cari hesabı bulunamadı.'}), 404
+        if mutevelli_cari.hesap_turu != "Mütevelli": # Opsiyonel kontrol
+            return jsonify({'message': 'Belirtilen cari hesap bir mütevelli hesabı değil.'}), 400
+        if mutevelli_cari.para_birimi.upper() != data['para_birimi'].upper():
+            return jsonify({'message': f'Bağış para birimi ({data["para_birimi"]}) ile mütevelli cari para birimi ({mutevelli_cari.para_birimi}) uyuşmuyor.'}), 400
 
     # Hisse adedi kontrolü
     if data['hayvan_turu'] == 'Küçükbaş' and hisse_adedi_int != 1:
         return jsonify({'message': 'Küçükbaş kurban için hisse adedi 1 olmalıdır.'}), 400
     if data['hayvan_turu'] == 'Büyükbaş Hisse' and not (1 <= hisse_adedi_int <= 7):
         return jsonify({'message': 'Büyükbaş hisse için hisse adedi 1 ile 7 arasında olmalıdır.'}), 400
-
 
     yeni_bagis = KurbanBagisi(
         bagisci_adi=data['bagisci_adi'],
@@ -119,26 +142,45 @@ def create_kurban_bagisi():
         hisse_adedi=hisse_adedi_int,
         vekalet_sahipleri=data.get('vekalet_sahipleri'),
         aciklama=data.get('aciklama'),
-        gelir_kasa_id=data['gelir_kasa_id']
+        alinan_sekli=alinan_sekli,
+        gelir_kasa_id=gelir_kasa_id if alinan_sekli in ["Nakit Kasa", "Banka"] else None,
+        mutevelli_cari_id=mutevelli_cari_id if alinan_sekli == "Mütevelli Üzerinden" else None
     )
-
 
     try:
         db.session.add(yeni_bagis)
         db.session.flush() # Yeni bağış ID'si oluşsun
 
-        add_kasa_hareketi(
-            kasa_id=gelir_kasa.id,
-            tutar=bagis_tutari_decimal, # Gelir
-            islem_tipi="Kurban Bağışı",
-            aciklama=f"{yeni_bagis.bagisci_adi} - {yeni_bagis.kurban_turu.tur_adi if yeni_bagis.kurban_turu else ''} Kurban Bağışı",
-            referans_tablo='kurban_bagislari',
-            referans_id=yeni_bagis.id,
-            user_id=g.current_user.id,
-            commit_session=False # Ana commit dışarıda
-        )
+        if alinan_sekli in ["Nakit Kasa", "Banka"]:
+            if not gelir_kasa:
+                raise ValueError("Gelir kasası geçerli değil.")
+            add_kasa_hareketi(
+                kasa_id=gelir_kasa.id,
+                tutar=bagis_tutari_decimal, # Gelir
+                islem_tipi="Kurban Bağışı",
+                aciklama=f"{yeni_bagis.bagisci_adi} - {yeni_bagis.kurban_turu.tur_adi if yeni_bagis.kurban_turu else ''} Kurban Bağışı",
+                referans_tablo='kurban_bagislari',
+                referans_id=yeni_bagis.id,
+                user_id=g.current_user.id,
+                commit_session=False
+            )
+        elif alinan_sekli == "Mütevelli Üzerinden":
+            if not mutevelli_cari:
+                raise ValueError("Mütevelli cari hesabı geçerli değil.")
+            from app.routes.cari_hesap_routes import add_cari_hesap_hareketi
+            add_cari_hesap_hareketi(
+                cari_hesap_id=mutevelli_cari.id,
+                tutar=bagis_tutari_decimal, # Mütevelli borçlandı (vakfın alacağı arttı)
+                islem_tipi="Mütevelli Üzerinden Kurban Bağışı",
+                aciklama=f"{yeni_bagis.bagisci_adi} adına alınan kurban bağışı.",
+                referans_tablo='kurban_bagislari',
+                referans_id=yeni_bagis.id,
+                user_id=g.current_user.id,
+                commit_session=False
+            )
+
         db.session.commit()
-    except ValueError as ve: # Kasa bulunamadı vs.
+    except ValueError as ve:
         db.session.rollback()
         return jsonify({'message': str(ve)}), 400
     except Exception as e:
@@ -151,21 +193,85 @@ def create_kurban_bagisi():
 @token_required
 def get_kurban_bagislari():
     # Filtreleme seçenekleri
-    kesim_durumu_filter = request.args.get('kesim_durumu') # true, false
+    # Filtreleme seçenekleri
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', 15, type=int)
+
+    tarih_baslangic_str = request.args.get('tarih_baslangic') # YYYY-MM-DD
+    tarih_bitis_str = request.args.get('tarih_bitis') # YYYY-MM-DD
+    sirala_alan = request.args.get('sirala_alan', 'bagis_tarihi')
+    sirala_yon = request.args.get('sirala_yon', 'desc')
+
+    kesim_durumu_filter = request.args.get('kesim_durumu') # true, false, null (belirsiz)
     kurban_turu_id_filter = request.args.get('kurban_turu_id', type=int)
     hayvan_turu_filter = request.args.get('hayvan_turu')
+    bagisci_adi_filter = request.args.get('bagisci_adi') # LIKE ile arama
+    vekalet_sahibi_filter = request.args.get('vekalet_sahibi') # LIKE ile arama
+    alinan_sekli_filter = request.args.get('alinan_sekli')
+    mutevelli_cari_id_filter = request.args.get('mutevelli_cari_id', type=int)
+    gelir_kasa_id_filter = request.args.get('gelir_kasa_id', type=int)
+
 
     query = KurbanBagisi.query
 
+    if tarih_baslangic_str:
+        try:
+            tarih_baslangic = datetime.fromisoformat(tarih_baslangic_str)
+            query = query.filter(KurbanBagisi.bagis_tarihi >= tarih_baslangic)
+        except ValueError:
+            return jsonify({'message': 'Geçersiz tarih_baslangic formatı. YYYY-MM-DD kullanın.'}), 400
+    if tarih_bitis_str:
+        try:
+            tarih_bitis = datetime.fromisoformat(tarih_bitis_str).replace(hour=23, minute=59, second=59)
+            query = query.filter(KurbanBagisi.bagis_tarihi <= tarih_bitis)
+        except ValueError:
+            return jsonify({'message': 'Geçersiz tarih_bitis formatı. YYYY-MM-DD kullanın.'}), 400
+
     if kesim_durumu_filter is not None:
-        query = query.filter(KurbanBagisi.kesim_durumu == (kesim_durumu_filter.lower() == 'true'))
+        if kesim_durumu_filter.lower() == 'true':
+            query = query.filter(KurbanBagisi.kesim_durumu == True)
+        elif kesim_durumu_filter.lower() == 'false':
+            query = query.filter(KurbanBagisi.kesim_durumu == False)
+        # 'null' veya başka bir değer gelirse filtre uygulanmaz veya isteğe bağlı olarak IS NULL eklenebilir.
+
     if kurban_turu_id_filter:
         query = query.filter(KurbanBagisi.kurban_turu_id == kurban_turu_id_filter)
     if hayvan_turu_filter:
         query = query.filter(KurbanBagisi.hayvan_turu == hayvan_turu_filter)
+    if bagisci_adi_filter:
+        query = query.filter(KurbanBagisi.bagisci_adi.ilike(f"%{bagisci_adi_filter}%"))
+    if vekalet_sahibi_filter: # vekalet_sahipleri alanı Text olduğu için LIKE ile arama
+        query = query.filter(KurbanBagisi.vekalet_sahipleri.ilike(f"%{vekalet_sahibi_filter}%"))
+    if alinan_sekli_filter:
+        query = query.filter(KurbanBagisi.alinan_sekli == alinan_sekli_filter)
+    if mutevelli_cari_id_filter:
+        query = query.filter(KurbanBagisi.mutevelli_cari_id == mutevelli_cari_id_filter)
+    if gelir_kasa_id_filter:
+        query = query.filter(KurbanBagisi.gelir_kasa_id == gelir_kasa_id_filter)
 
-    bagislar = query.order_by(KurbanBagisi.bagis_tarihi.desc()).all()
-    return jsonify([b.to_dict() for b in bagislar]), 200
+    # Sıralama
+    valid_sort_fields = {
+        'bagis_tarihi': KurbanBagisi.bagis_tarihi,
+        'bagisci_adi': KurbanBagisi.bagisci_adi,
+        'bagis_tutari': KurbanBagisi.bagis_tutari,
+        'kesim_tarihi': KurbanBagisi.kesim_tarihi,
+        'id': KurbanBagisi.id
+    }
+    sort_column = valid_sort_fields.get(sirala_alan, KurbanBagisi.bagis_tarihi)
+    if sirala_yon == 'asc':
+        query = query.order_by(sort_column.asc())
+    else:
+        query = query.order_by(sort_column.desc())
+
+    paginated_bagislar = query.paginate(page=page, per_page=per_page, error_out=False)
+
+    return jsonify({
+        'bagislar': [b.to_dict() for b in paginated_bagislar.items],
+        'total': paginated_bagislar.total,
+        'page': paginated_bagislar.page,
+        'per_page': paginated_bagislar.per_page,
+        'total_pages': paginated_bagislar.pages
+    }), 200
 
 @kurban_bp.route('/bagislar/<int:bagis_id>', methods=['GET'])
 @token_required
@@ -301,20 +407,30 @@ def delete_kurban_bagisi(bagis_id):
     try:
         db.session.begin_nested() # İşlemleri grupla
 
-        # 1. Gelir hareketini tersine çevir (kasadan düş)
-        # Bu hareketin var olduğunu ve ID'sinin referanslandığını varsayıyoruz.
-        # Daha sağlam bir yol, KasaHareketi'ni referans_tablo ve referans_id ile bulup silmek veya tersini eklemek.
-        # Şimdilik yeni bir ters hareket ekleyelim.
-        add_kasa_hareketi(
-            kasa_id=bagis.gelir_kasa_id,
-            tutar=-bagis.bagis_tutari, # Bağış tutarını çıkar (negatif)
-            islem_tipi="Kurban Bağışı İptali",
-            aciklama=f"İptal: Bağış ID {bagis.id} - {bagis.bagisci_adi}",
-            referans_tablo='kurban_bagislari', # İptal edilen bağışa referans
-            referans_id=bagis.id,
-            user_id=g.current_user.id,
-            commit_session=False
-        )
+        # 1. Gelir hareketini veya cari hareketi tersine çevir
+        if bagis.alinan_sekli in ["Nakit Kasa", "Banka"] and bagis.gelir_kasa_id:
+            add_kasa_hareketi(
+                kasa_id=bagis.gelir_kasa_id,
+                tutar=-bagis.bagis_tutari, # Bağış tutarını çıkar (negatif)
+                islem_tipi="Kurban Bağışı İptali (Kasa)",
+                aciklama=f"İptal: Bağış ID {bagis.id} - {bagis.bagisci_adi}",
+                referans_tablo='kurban_bagislari',
+                referans_id=bagis.id,
+                user_id=g.current_user.id,
+                commit_session=False
+            )
+        elif bagis.alinan_sekli == "Mütevelli Üzerinden" and bagis.mutevelli_cari_id:
+            from app.routes.cari_hesap_routes import add_cari_hesap_hareketi
+            add_cari_hesap_hareketi(
+                cari_hesap_id=bagis.mutevelli_cari_id,
+                tutar=-bagis.bagis_tutari, # Mütevellinin borcunu azalt (alacak kaydı)
+                islem_tipi="Kurban Bağışı İptali (Mütevelli)",
+                aciklama=f"İptal: Bağış ID {bagis.id} - {bagis.bagisci_adi}",
+                referans_tablo='kurban_bagislari',
+                referans_id=bagis.id,
+                user_id=g.current_user.id,
+                commit_session=False
+            )
 
         # 2. Eğer kesim masrafı yapıldıysa, masraf hareketini tersine çevir (kasaya iade)
         if bagis.kesim_masrafi and bagis.kesim_masrafi > 0 and bagis.kesim_masraf_kasa_id:

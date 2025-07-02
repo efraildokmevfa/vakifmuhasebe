@@ -165,20 +165,76 @@ def hesapla_ve_kaydet_maas():
 @maas_bp.route('/odemeler', methods=['GET'])
 @token_required
 def get_maas_odemeleri():
-    personel_id = request.args.get('personel_id', type=int)
-    donem_yil = request.args.get('donem_yil', type=int)
-    donem_ay = request.args.get('donem_ay', type=int)
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', 15, type=int)
+    tarih_baslangic_str = request.args.get('tarih_baslangic') # Ödeme tarihi için
+    tarih_bitis_str = request.args.get('tarih_bitis') # Ödeme tarihi için
+    sirala_alan = request.args.get('sirala_alan', 'odeme_tarihi')
+    sirala_yon = request.args.get('sirala_yon', 'desc')
+
+    personel_id_filter = request.args.get('personel_id', type=int)
+    donem_yil_filter = request.args.get('donem_yil', type=int)
+    donem_ay_filter = request.args.get('donem_ay', type=int)
+    kasa_id_filter = request.args.get('kasa_id', type=int)
+    durum_filter = request.args.get('durum')
+    para_birimi_filter = request.args.get('para_birimi')
 
     query = MaasOdeme.query
-    if personel_id:
-        query = query.filter(MaasOdeme.personel_id == personel_id)
-    if donem_yil:
-        query = query.filter(MaasOdeme.donem_yil == donem_yil)
-    if donem_ay:
-        query = query.filter(MaasOdeme.donem_ay == donem_ay)
 
-    odemeler = query.order_by(MaasOdeme.donem_yil.desc(), MaasOdeme.donem_ay.desc(), MaasOdeme.odeme_tarihi.desc()).all()
-    return jsonify([o.to_dict() for o in odemeler]), 200
+    if tarih_baslangic_str:
+        try:
+            tarih_baslangic = datetime.fromisoformat(tarih_baslangic_str)
+            query = query.filter(MaasOdeme.odeme_tarihi >= tarih_baslangic)
+        except ValueError:
+            return jsonify({'message': 'Geçersiz tarih_baslangic formatı.'}), 400
+    if tarih_bitis_str:
+        try:
+            tarih_bitis = datetime.fromisoformat(tarih_bitis_str).replace(hour=23, minute=59, second=59)
+            query = query.filter(MaasOdeme.odeme_tarihi <= tarih_bitis)
+        except ValueError:
+            return jsonify({'message': 'Geçersiz tarih_bitis formatı.'}), 400
+
+    if personel_id_filter:
+        query = query.filter(MaasOdeme.personel_id == personel_id_filter)
+    if donem_yil_filter:
+        query = query.filter(MaasOdeme.donem_yil == donem_yil_filter)
+    if donem_ay_filter:
+        query = query.filter(MaasOdeme.donem_ay == donem_ay_filter)
+    if kasa_id_filter:
+        query = query.filter(MaasOdeme.odeme_kasa_id == kasa_id_filter)
+    if durum_filter:
+        query = query.filter(MaasOdeme.durum == durum_filter)
+    if para_birimi_filter:
+        query = query.filter(MaasOdeme.para_birimi == para_birimi_filter.upper())
+
+    valid_sort_fields = {
+        'odeme_tarihi': MaasOdeme.odeme_tarihi,
+        'donem': [MaasOdeme.donem_yil, MaasOdeme.donem_ay], # Birden fazla alana göre sıralama
+        'personel_id': MaasOdeme.personel_id,
+        'fiili_odenen_tutar': MaasOdeme.fiili_odenen_tutar,
+        'id': MaasOdeme.id
+    }
+
+    sort_column_def = valid_sort_fields.get(sirala_alan, MaasOdeme.odeme_tarihi)
+
+    if isinstance(sort_column_def, list): # Eğer birden fazla alanla sıralama yapılacaksa
+        order_expressions = []
+        for col in sort_column_def:
+            order_expressions.append(col.asc() if sirala_yon == 'asc' else col.desc())
+        query = query.order_by(*order_expressions)
+    else: # Tek alanla sıralama
+        sort_column = sort_column_def
+        query = query.order_by(sort_column.asc() if sirala_yon == 'asc' else sort_column.desc())
+
+    paginated_odemeler = query.paginate(page=page, per_page=per_page, error_out=False)
+
+    return jsonify({
+        'odemeler': [o.to_dict() for o in paginated_odemeler.items],
+        'total': paginated_odemeler.total,
+        'page': paginated_odemeler.page,
+        'per_page': paginated_odemeler.per_page,
+        'total_pages': paginated_odemeler.pages
+    }), 200
 
 @maas_bp.route('/odemeler/<int:odeme_id>', methods=['GET'])
 @token_required

@@ -102,21 +102,64 @@ def get_kasa_by_id(kasa_id):
 @kasa_bp.route('/<int:kasa_id>/hareketler', methods=['GET'])
 @token_required
 def get_kasa_hareketleri(kasa_id):
-    Kasa.query.get_or_404(kasa_id) # Kasanın varlığını kontrol et
+    Kasa.query.get_or_404(kasa_id)
 
     page = request.args.get('page', 1, type=int)
-    per_page = request.args.get('per_page', 10, type=int)
+    per_page = request.args.get('per_page', 15, type=int)
+    tarih_baslangic_str = request.args.get('tarih_baslangic')
+    tarih_bitis_str = request.args.get('tarih_bitis')
+    sirala_alan = request.args.get('sirala_alan', 'tarih')
+    sirala_yon = request.args.get('sirala_yon', 'desc')
 
-    hareketler = KasaHareketi.query.filter_by(kasa_id=kasa_id)\
-        .order_by(KasaHareketi.tarih.desc(), KasaHareketi.id.desc())\
-        .paginate(page=page, per_page=per_page, error_out=False)
+    islem_tipi_filter = request.args.get('islem_tipi')
+    referans_tablo_filter = request.args.get('referans_tablo')
+    referans_id_filter = request.args.get('referans_id', type=int)
+    user_id_filter = request.args.get('user_id', type=int)
+
+    query = KasaHareketi.query.filter_by(kasa_id=kasa_id)
+
+    if tarih_baslangic_str:
+        try:
+            tarih_baslangic = datetime.fromisoformat(tarih_baslangic_str)
+            query = query.filter(KasaHareketi.tarih >= tarih_baslangic)
+        except ValueError:
+            return jsonify({'message': 'Geçersiz tarih_baslangic formatı.'}), 400
+    if tarih_bitis_str:
+        try:
+            tarih_bitis = datetime.fromisoformat(tarih_bitis_str).replace(hour=23, minute=59, second=59)
+            query = query.filter(KasaHareketi.tarih <= tarih_bitis)
+        except ValueError:
+            return jsonify({'message': 'Geçersiz tarih_bitis formatı.'}), 400
+
+    if islem_tipi_filter:
+        query = query.filter(KasaHareketi.islem_tipi.ilike(f"%{islem_tipi_filter}%"))
+    if referans_tablo_filter:
+        query = query.filter(KasaHareketi.referans_tablo == referans_tablo_filter)
+    if referans_id_filter:
+        query = query.filter(KasaHareketi.referans_id == referans_id_filter)
+    if user_id_filter:
+        query = query.filter(KasaHareketi.user_id == user_id_filter)
+
+    valid_sort_fields = {
+        'tarih': KasaHareketi.tarih,
+        'tutar': KasaHareketi.tutar,
+        'islem_tipi': KasaHareketi.islem_tipi,
+        'id': KasaHareketi.id
+    }
+    sort_column = valid_sort_fields.get(sirala_alan, KasaHareketi.tarih)
+    if sirala_yon == 'asc':
+        query = query.order_by(sort_column.asc())
+    else:
+        query = query.order_by(sort_column.desc(), KasaHareketi.id.desc()) # Tarih aynıysa ID'ye göre de sırala
+
+    paginated_hareketler = query.paginate(page=page, per_page=per_page, error_out=False)
 
     return jsonify({
-        'hareketler': [h.to_dict() for h in hareketler.items],
-        'total': hareketler.total,
-        'page': hareketler.page,
-        'per_page': hareketler.per_page,
-        'total_pages': hareketler.pages
+        'hareketler': [h.to_dict() for h in paginated_hareketler.items],
+        'total': paginated_hareketler.total,
+        'page': paginated_hareketler.page,
+        'per_page': paginated_hareketler.per_page,
+        'total_pages': paginated_hareketler.pages
     }), 200
 
 
@@ -214,3 +257,119 @@ def delete_kasa(kasa_id):
         db.session.rollback()
         return jsonify({'message': f'Kasa silinirken hata: {str(e)}'}), 500
     return jsonify({'message': 'Kasa başarıyla silindi'}), 200
+
+
+# --- Kasalar Arası Virman ---
+@kasa_bp.route('/virman', methods=['POST'])
+@token_required
+# @role_required(['admin', 'accountant'])
+def kasa_virman():
+    data = request.get_json()
+    required_fields = ['kaynak_kasa_id', 'hedef_kasa_id', 'tutar', 'para_birimi_kaynak']
+    for field in required_fields:
+        if not data.get(field):
+            return jsonify({'message': f'Eksik bilgi: {field} zorunludur.'}), 400
+
+    try:
+        kaynak_kasa_id = int(data['kaynak_kasa_id'])
+        hedef_kasa_id = int(data['hedef_kasa_id'])
+        tutar_kaynak = Decimal(data['tutar'])
+        if tutar_kaynak <= 0: raise ValueError("Virman tutarı pozitif olmalı.")
+    except (ValueError, TypeError):
+        return jsonify({'message': 'Geçersiz ID veya tutar formatı.'}), 400
+
+    if kaynak_kasa_id == hedef_kasa_id:
+        return jsonify({'message': 'Kaynak ve hedef kasa aynı olamaz.'}), 400
+
+    kaynak_kasa = Kasa.query.get(kaynak_kasa_id)
+    hedef_kasa = Kasa.query.get(hedef_kasa_id)
+
+    if not kaynak_kasa: return jsonify({'message': 'Kaynak kasa bulunamadı.'}), 404
+    if not hedef_kasa: return jsonify({'message': 'Hedef kasa bulunamadı.'}), 404
+
+    para_birimi_kaynak = data['para_birimi_kaynak'].upper()
+    para_birimi_hedef = data.get('para_birimi_hedef', hedef_kasa.para_birimi).upper() # Hedef PB belirtilmezse hedef kasanın PB'si
+    kur_str = data.get('kur') # Eğer PB'ler farklıysa kur zorunlu olacak
+
+    if kaynak_kasa.para_birimi != para_birimi_kaynak:
+        return jsonify({'message': f'Belirtilen kaynak para birimi ({para_birimi_kaynak}) ile kaynak kasanın ({kaynak_kasa.kasa_adi}) para birimi ({kaynak_kasa.para_birimi}) uyuşmuyor.'}), 400
+
+    if kaynak_kasa.bakiye < tutar_kaynak:
+        return jsonify({'message': f'Kaynak kasada ({kaynak_kasa.kasa_adi}) yeterli bakiye yok. Talep edilen: {tutar_kaynak}, Mevcut: {kaynak_kasa.bakiye}'}), 400
+
+    tutar_hedef = tutar_kaynak
+    if para_birimi_kaynak != para_birimi_hedef:
+        if not kur_str:
+            return jsonify({'message': 'Para birimleri farklıysa kur belirtilmelidir (1 hedef birim = X kaynak birim).'}), 400
+        try:
+            kur = Decimal(kur_str)
+            if kur <= 0: raise ValueError("Kur pozitif olmalı.")
+            # Kur tanımı: 1 hedef PB = `kur` * kaynak PB. Yani Kaynak Tutar / Kur = Hedef Tutar
+            # Örnek: USD(kaynak) -> EUR(hedef). Kur=0.92 (1 EUR = 0.92 USD ise yanlış, 1 USD = 0.92 EUR olmalı)
+            # Ya da: 100 USD virman yapılacak, 1 EUR = 1.08 USD. Kur = 1.08.  Hedef tutar = 100 USD / 1.08 USD/EUR = 92.59 EUR
+            # Kullanıcıdan kuru "1 hedef_pb = X kaynak_pb" olarak alalım.
+            # Yani, 1 EUR = 1.08 USD ise, kur = 1.08. Hedef tutar = Kaynak Tutar / Kur
+            # Eğer kur "1 kaynak_pb = X hedef_pb" ise, Hedef tutar = Kaynak Tutar * Kur
+            # Plandaki tanım: `kur` (1 hedef birim kaç kaynak birim ediyor) -> Bu durumda Kaynak Tutar / Kur
+            # Eğer planı "1 kaynak birim kaç hedef birim ediyor" olarak anlarsak Kaynak Tutar * Kur
+            # Daha açık olması için kullanıcıdan "hedef_tutar" da alınabilir veya kurun yönü netleştirilmeli.
+            # Şimdilik plandaki gibi (1 hedef = X kaynak) kabul edelim: tutar_hedef = tutar_kaynak / kur
+            # Veya daha basiti, eğer kur "hedef_pb / kaynak_pb" oranı ise: tutar_hedef = tutar_kaynak * kur
+            # Gelen kurun neyi ifade ettiğini netleştirmek önemli.
+            # Varsayım: Kullanıcı "1 Kaynak PB = X Hedef PB" olarak kur giriyor. Yani USD'den EUR'ya ise 1 USD = 0.92 EUR ise kur=0.92
+            tutar_hedef = tutar_kaynak * kur
+        except (ValueError, TypeError):
+            return jsonify({'message': 'Geçersiz kur formatı.'}), 400
+        if hedef_kasa.para_birimi != para_birimi_hedef:
+             return jsonify({'message': f'Belirtilen hedef para birimi ({para_birimi_hedef}) ile hedef kasanın ({hedef_kasa.kasa_adi}) para birimi ({hedef_kasa.para_birimi}) uyuşmuyor.'}), 400
+    else: # Para birimleri aynıysa kur 1'dir
+        if hedef_kasa.para_birimi != para_birimi_kaynak: # Bu durum yukarıda kaynak kasa kontrolünde yakalanmalıydı ama yine de...
+            return jsonify({'message': f'Hedef kasa ({hedef_kasa.kasa_adi}) para birimi ({hedef_kasa.para_birimi}), kaynak para birimiyle ({para_birimi_kaynak}) aynı olmalıydı (kur belirtilmedi).'}), 400
+        kur = Decimal('1.0')
+
+
+    aciklama_kaynak = data.get('aciklama', f"{hedef_kasa.kasa_adi} kasasına virman.") + f" (Hedef Kasa ID: {hedef_kasa.id})"
+    aciklama_hedef = data.get('aciklama', f"{kaynak_kasa.kasa_adi} kasasından virman.") + f" (Kaynak Kasa ID: {kaynak_kasa.id})"
+    if para_birimi_kaynak != para_birimi_hedef:
+        aciklama_kaynak += f" Kur: {kur}"
+        aciklama_hedef += f" Kur: {kur}"
+
+
+    try:
+        # 1. Kaynak kasadan çıkış
+        h_kaynak = add_kasa_hareketi(
+            kasa_id=kaynak_kasa.id,
+            tutar=-tutar_kaynak, # Gider
+            islem_tipi="Kasalar Arası Virman (Çıkış)",
+            aciklama=aciklama_kaynak,
+            referans_tablo='kasalar', # Hedef kasaya referans
+            referans_id=hedef_kasa.id,
+            user_id=g.current_user.id,
+            commit_session=False
+        )
+        # 2. Hedef kasaya giriş
+        h_hedef = add_kasa_hareketi(
+            kasa_id=hedef_kasa.id,
+            tutar=tutar_hedef, # Gelir
+            islem_tipi="Kasalar Arası Virman (Giriş)",
+            aciklama=aciklama_hedef,
+            referans_tablo='kasalar', # Kaynak kasaya referans
+            referans_id=kaynak_kasa.id,
+            user_id=g.current_user.id,
+            commit_session=False
+        )
+        db.session.commit()
+    except ValueError as ve:
+        db.session.rollback()
+        return jsonify({'message': str(ve)}), 400
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'message': f'Virman işlemi sırasında hata: {str(e)}'}), 500
+
+    return jsonify({
+        'message': 'Kasalar arası virman başarıyla tamamlandı.',
+        'kaynak_kasa_son_bakiye': str(kaynak_kasa.bakiye),
+        'hedef_kasa_son_bakiye': str(hedef_kasa.bakiye),
+        'kaynak_hareket_id': h_kaynak.id,
+        'hedef_hareket_id': h_hedef.id
+    }), 200
